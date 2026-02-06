@@ -559,6 +559,22 @@ code {
     opacity: 0.5;
 }
 
+/* ==================== PACKET VIEWER ==================== */
+
+#packets-table tbody tr {
+    cursor: pointer;
+}
+
+#packets-table tbody tr:hover {
+    background-color: var(--bg-table-hover);
+}
+
+#packet-hex-content {
+    background-color: var(--bg-code);
+    color: var(--text-primary);
+    font-family: 'Courier New', monospace;
+}
+
 /* ==================== RISK INDICATORS ==================== */
 
 .risk-low {

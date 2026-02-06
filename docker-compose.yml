@@ -6,13 +6,46 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       - DATABASE_URL=postgresql://pcap_user:pcap_pass@db:5432/pcap_analyzer
       - UPLOAD_FOLDER=/app/data/uploads
       - FLASK_ENV=production
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY:-}
     volumes:
       - uploads_data:/app/data/uploads
       - settings_data:/app/data/settings
+    restart: unless-stopped
+
+  celery_worker:
+    build: .
+    command: celery -A celery_app.celery worker --loglevel=info --concurrency=2
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://pcap_user:pcap_pass@db:5432/pcap_analyzer
+      - UPLOAD_FOLDER=/app/data/uploads
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY:-}
+    volumes:
+      - uploads_data:/app/data/uploads
+      - settings_data:/app/data/settings
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped
 
   db:

@@ -187,6 +187,12 @@
                     </button>
                 </li>
                 <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="packets-tab" data-bs-toggle="tab"
+                            data-bs-target="#packets" type="button" role="tab">
+                        <i class="fas fa-stream"></i> Pacotes
+                    </button>
+                </li>
+                <li class="nav-item" role="presentation">
                     <button class="nav-link" id="settings-tab" data-bs-toggle="tab"
                             data-bs-target="#settings" type="button" role="tab">
                         <i class="fas fa-cog"></i> Configurações
@@ -198,6 +204,16 @@
             <div class="tab-content mt-3" id="tabContent">
                 <!-- TAB 1: VISÃO GERAL -->
                 <div class="tab-pane fade show active" id="overview" role="tabpanel">
+                    <!-- Report Download Buttons -->
+                    <div class="d-flex justify-content-end mb-3 gap-2" id="report-buttons" style="display:none !important;">
+                        <button class="btn btn-sm btn-outline-danger" onclick="downloadReport('pdf')" id="download-pdf-btn" disabled>
+                            <i class="fas fa-file-pdf"></i> Download PDF
+                        </button>
+                        <button class="btn btn-sm btn-outline-primary" onclick="downloadReport('html')" id="download-html-btn" disabled>
+                            <i class="fas fa-file-code"></i> Download HTML
+                        </button>
+                    </div>
+
                     <!-- Metrics Cards -->
                     <div class="row mb-4">
                         <div class="col-md-2">
@@ -315,6 +331,7 @@
                                         <th>Grupo</th>
                                         <th>Tipo</th>
                                         <th>Localização</th>
+                                        <th>Reputação</th>
                                         <th>Pacotes Env.</th>
                                         <th>Pacotes Rec.</th>
                                         <th>Bytes Env.</th>
@@ -377,7 +394,72 @@
                     </div>
                 </div>
 
-                <!-- TAB 5: CONFIGURAÇÕES -->
+                <!-- TAB 5: PACOTES (Wireshark-style viewer) -->
+                <div class="tab-pane fade" id="packets" role="tabpanel">
+                    <div class="card shadow-sm">
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <span><i class="fas fa-stream"></i> Visualizador de Pacotes</span>
+                            <small class="text-muted" id="packets-total-info"></small>
+                        </div>
+                        <div class="card-body">
+                            <!-- Packet Filters -->
+                            <div class="row mb-3 g-2">
+                                <div class="col-md-3">
+                                    <input type="text" class="form-control form-control-sm" id="filter-packet-ip" placeholder="Filtrar por IP">
+                                </div>
+                                <div class="col-md-2">
+                                    <select class="form-select form-select-sm" id="filter-packet-protocol">
+                                        <option value="">Todos Protocolos</option>
+                                        <option value="TCP">TCP</option>
+                                        <option value="UDP">UDP</option>
+                                        <option value="ICMP">ICMP</option>
+                                        <option value="ARP">ARP</option>
+                                        <option value="DNS">DNS</option>
+                                        <option value="HTTP">HTTP</option>
+                                        <option value="HTTPS">HTTPS</option>
+                                    </select>
+                                </div>
+                                <div class="col-md-2">
+                                    <button class="btn btn-sm btn-primary w-100" onclick="loadPackets(1)">
+                                        <i class="fas fa-filter"></i> Filtrar
+                                    </button>
+                                </div>
+                                <div class="col-md-5 d-flex justify-content-end align-items-center gap-2">
+                                    <button class="btn btn-sm btn-outline-secondary" id="packet-prev-page" onclick="loadPackets(currentPacketPage - 1)" disabled>
+                                        <i class="fas fa-chevron-left"></i>
+                                    </button>
+                                    <span class="small" id="packet-page-info">Página 1</span>
+                                    <button class="btn btn-sm btn-outline-secondary" id="packet-next-page" onclick="loadPackets(currentPacketPage + 1)">
+                                        <i class="fas fa-chevron-right"></i>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Packets Table -->
+                            <div class="table-responsive">
+                                <table class="table table-sm table-hover table-bordered" id="packets-table">
+                                    <thead>
+                                        <tr>
+                                            <th style="width:60px">No.</th>
+                                            <th style="width:100px">Tempo</th>
+                                            <th>Origem</th>
+                                            <th>Destino</th>
+                                            <th style="width:80px">Protocolo</th>
+                                            <th style="width:60px">Tam.</th>
+                                            <th>Info</th>
+                                            <th style="width:50px"></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="packets-tbody">
+                                        <tr><td colspan="8" class="text-center text-muted">Clique na aba para carregar pacotes</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- TAB 6: CONFIGURAÇÕES -->
                 <div class="tab-pane fade" id="settings" role="tabpanel">
                     <div class="row">
                         <!-- Thresholds -->
@@ -406,6 +488,28 @@
                                     <div class="mb-3">
                                         <label class="form-label">DNS Tunneling - Entropia Mínima</label>
                                         <input type="number" step="0.1" class="form-control" id="threshold-dns-entropy" value="3.5">
+                                    </div>
+                                    <hr>
+                                    <h6><i class="fas fa-satellite-dish"></i> Beaconing (C2)</h6>
+                                    <div class="mb-3">
+                                        <label class="form-label">Conexões Mínimas</label>
+                                        <input type="number" class="form-control" id="threshold-beaconing-connections" value="5">
+                                        <small class="form-text text-muted">Mínimo de conexões para detectar beaconing</small>
+                                    </div>
+                                    <div class="mb-3">
+                                        <label class="form-label">Jitter Máximo (%)</label>
+                                        <input type="number" class="form-control" id="threshold-beaconing-jitter" value="10">
+                                        <small class="form-text text-muted">Variação máxima no intervalo</small>
+                                    </div>
+                                    <hr>
+                                    <h6><i class="fas fa-key"></i> Brute Force (SSH/FTP)</h6>
+                                    <div class="mb-3">
+                                        <label class="form-label">Tentativas Mínimas</label>
+                                        <input type="number" class="form-control" id="threshold-brute-force-attempts" value="10">
+                                    </div>
+                                    <div class="mb-3">
+                                        <label class="form-label">Janela de Tempo (segundos)</label>
+                                        <input type="number" class="form-control" id="threshold-brute-force-time" value="60">
                                     </div>
                                     <button class="btn btn-primary" id="save-thresholds-btn">
                                         <i class="fas fa-save"></i> Salvar Thresholds
@@ -557,6 +661,37 @@
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Fechar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: Packet Detail -->
+    <div class="modal fade" id="packetDetailModal" tabindex="-1">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="fas fa-cube"></i> Pacote #<span id="packet-detail-number"></span></h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="text-muted mb-3" id="packet-detail-summary"></p>
+                    <ul class="nav nav-tabs" id="packetDetailTabs" role="tablist">
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#pkt-layers" type="button">Camadas</button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pkt-hex" type="button">Hex Dump</button>
+                        </li>
+                    </ul>
+                    <div class="tab-content mt-2">
+                        <div class="tab-pane fade show active" id="pkt-layers" role="tabpanel">
+                            <div id="packet-layers-content"></div>
+                        </div>
+                        <div class="tab-pane fade" id="pkt-hex" role="tabpanel">
+                            <pre id="packet-hex-content" style="font-size:12px; max-height:400px; overflow:auto; background:var(--bg-code); padding:10px; border-radius:4px;"></pre>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>

@@ -427,6 +427,12 @@ class PCAPAnalyzer:
         # 7. External SMB Access (novo)
         alerts.extend(self._detect_external_smb_access())
 
+        # 8. Beaconing Detection (C2 Communication)
+        alerts.extend(self._detect_beaconing())
+
+        # 9. Brute Force Detection (SSH/FTP)
+        alerts.extend(self._detect_brute_force())
+
         # Adicionar timestamp aos alertas
         for alert in alerts:
             if "timestamp" not in alert:
@@ -752,6 +758,161 @@ class PCAPAnalyzer:
                     },
                     "recommendation": "SMB traffic to external IPs is unusual and potentially dangerous. This could indicate data exfiltration or compromised host. Investigate immediately."
                 })
+
+        return alerts
+
+    def _detect_beaconing(self):
+        """
+        Detect beaconing behavior (C2 communication)
+        Looks for periodic outbound connections with low jitter
+        """
+        threshold_connections = self.settings.get("thresholds", {}).get("beaconing_min_connections", 5)
+        max_jitter_percent = self.settings.get("thresholds", {}).get("beaconing_max_jitter_percent", 10)
+
+        alerts = []
+
+        # Track outbound SYN connections: (src_ip, dst_ip, dst_port) -> timestamps
+        connections = defaultdict(list)
+
+        for pkt in self.packets:
+            if TCP in pkt and IP in pkt:
+                src_ip = pkt[IP].src
+                dst_ip = pkt[IP].dst
+                dst_port = pkt[TCP].dport
+                timestamp = float(pkt.time)
+
+                # Only track outbound connections (local -> external)
+                if self._is_local_ip(src_ip) and not self._is_local_ip(dst_ip):
+                    if pkt[TCP].flags & 0x02:  # SYN flag
+                        connections[(src_ip, dst_ip, dst_port)].append(timestamp)
+
+        for (src_ip, dst_ip, dst_port), timestamps in connections.items():
+            timestamps = sorted(timestamps)
+
+            if len(timestamps) < threshold_connections:
+                continue
+
+            # Calculate intervals between connections
+            intervals = [timestamps[i] - timestamps[i-1] for i in range(1, len(timestamps))]
+            if not intervals:
+                continue
+
+            mean_interval = sum(intervals) / len(intervals)
+            if mean_interval <= 0:
+                continue
+
+            # Calculate jitter as max deviation percentage from mean
+            max_deviation = max(abs(iv - mean_interval) for iv in intervals)
+            jitter_percent = (max_deviation / mean_interval) * 100
+
+            if jitter_percent < max_jitter_percent:
+                severity = "critical" if jitter_percent < 5 else "high"
+
+                alerts.append({
+                    "severity": severity,
+                    "category": "beaconing",
+                    "title": "Beaconing Behavior Detected (Possible C2)",
+                    "description": f"Host {src_ip} shows periodic connections to {dst_ip}:{dst_port} "
+                                   f"({len(timestamps)} connections, {jitter_percent:.1f}% jitter, "
+                                   f"~{mean_interval:.1f}s interval)",
+                    "ip": src_ip,
+                    "details": {
+                        "source_ip": src_ip,
+                        "destination_ip": dst_ip,
+                        "destination_port": dst_port,
+                        "connection_count": len(timestamps),
+                        "mean_interval_seconds": round(mean_interval, 2),
+                        "jitter_percent": round(jitter_percent, 2),
+                        "duration": round(timestamps[-1] - timestamps[0], 2)
+                    },
+                    "recommendation": "This pattern is consistent with C2 (Command and Control) beaconing. "
+                                      f"Investigate the destination IP {dst_ip} and port {dst_port}. "
+                                      "Check for malware on the source host. Block the destination if confirmed malicious."
+                })
+
+        return alerts
+
+    def _detect_brute_force(self):
+        """
+        Detect brute force attacks on SSH (port 22) and FTP (port 21)
+        Looks for multiple connection attempts in a short time window
+        """
+        threshold_attempts = self.settings.get("thresholds", {}).get("brute_force_attempts", 10)
+        time_window = self.settings.get("thresholds", {}).get("brute_force_time_window", 60)
+
+        alerts = []
+        target_ports = {22: "SSH", 21: "FTP"}
+
+        # Track connection attempts: (src_ip, dst_ip, port) -> [(timestamp, is_failed)]
+        attempts = defaultdict(list)
+
+        for pkt in self.packets:
+            if TCP in pkt and IP in pkt:
+                src_ip = pkt[IP].src
+                dst_ip = pkt[IP].dst
+                dst_port = pkt[TCP].dport
+                src_port = pkt[TCP].sport
+                timestamp = float(pkt.time)
+                flags = pkt[TCP].flags
+
+                # Track SYN to target ports (connection attempts)
+                if dst_port in target_ports and (flags & 0x02):
+                    attempts[(src_ip, dst_ip, dst_port)].append({
+                        'timestamp': timestamp,
+                        'is_failed': False
+                    })
+
+                # Track RST from server (failed connection)
+                if src_port in target_ports and (flags & 0x04):
+                    key = (dst_ip, src_ip, src_port)
+                    if key in attempts and attempts[key]:
+                        attempts[key][-1]['is_failed'] = True
+
+        already_alerted = set()
+
+        for (src_ip, dst_ip, dst_port), attempt_list in attempts.items():
+            if len(attempt_list) < threshold_attempts:
+                continue
+
+            attempt_list.sort(key=lambda x: x['timestamp'])
+
+            for i in range(len(attempt_list)):
+                if (src_ip, dst_ip, dst_port) in already_alerted:
+                    break
+
+                window_start = attempt_list[i]['timestamp']
+                window_end = window_start + time_window
+
+                in_window = [a for a in attempt_list if window_start <= a['timestamp'] <= window_end]
+
+                if len(in_window) >= threshold_attempts:
+                    failed_count = sum(1 for a in in_window if a['is_failed'])
+                    protocol = target_ports[dst_port]
+                    severity = "critical" if failed_count > threshold_attempts * 0.7 else "high"
+
+                    alerts.append({
+                        "severity": severity,
+                        "category": "brute_force",
+                        "title": f"Brute Force Attack Detected ({protocol})",
+                        "description": f"IP {src_ip} attempted {len(in_window)} connections to "
+                                       f"{protocol} on {dst_ip} in {time_window}s ({failed_count} failed)",
+                        "ip": src_ip,
+                        "details": {
+                            "source_ip": src_ip,
+                            "target_ip": dst_ip,
+                            "protocol": protocol,
+                            "port": dst_port,
+                            "total_attempts": len(in_window),
+                            "failed_attempts": failed_count,
+                            "time_window": time_window,
+                            "duration": round(in_window[-1]['timestamp'] - in_window[0]['timestamp'], 2)
+                        },
+                        "recommendation": f"This is a brute force attack on {protocol}. Block the source IP "
+                                          f"{src_ip} immediately. Review authentication logs on {dst_ip}. "
+                                          "Consider implementing fail2ban or similar tools."
+                    })
+                    already_alerted.add((src_ip, dst_ip, dst_port))
+                    break
 
         return alerts
 

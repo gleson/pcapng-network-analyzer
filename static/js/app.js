@@ -13,6 +13,8 @@ let ipsDataTable = null;
 let protocolsDataTable = null;
 let currentViewMode = 'single';  // 'single' ou 'aggregate'
 let selectedScanIds = [];
+let currentPacketPage = 1;
+let currentScanId = null;
 
 // ==================== INICIALIZAÇÃO ====================
 
@@ -65,6 +67,13 @@ $(document).ready(function() {
     // Event listeners - IP Names
     $('#save-ip-name-btn').on('click', saveIpName);
     $('#add-ip-name-btn').on('click', addIpNameFromModal);
+
+    // Event listeners - Packets tab
+    $('button[data-bs-target="#packets"]').on('shown.bs.tab', function() {
+        if (currentScanId && $('#packets-tbody tr').length <= 1) {
+            loadPackets(1);
+        }
+    });
 
     // Event listeners - Modals
     $('#ipNamesModal').on('show.bs.modal', loadIpNamesModal);
@@ -290,6 +299,7 @@ function renderScanHistory(scans) {
 }
 
 function viewScan(scanId) {
+    currentScanId = scanId;
     loadResults(scanId, 'single');
     $('#view-mode-indicator').hide();
 }
@@ -514,6 +524,9 @@ function loadResults(scanId = null, view = 'single', scanIds = null, dateFrom = 
         success: function(response) {
             if (response.success && response.data) {
                 currentData = response.data;
+                if (response.scan_id) {
+                    currentScanId = response.scan_id;
+                }
                 renderResults(currentData);
                 $('#results-section').fadeIn();
                 updateStatus('completed', 'Analysis completed');
@@ -529,10 +542,22 @@ function loadResults(scanId = null, view = 'single', scanIds = null, dateFrom = 
 }
 
 function renderResults(data) {
+    // Track current scan ID for packets/reports
+    if (data.summary && data.summary.scan_id) {
+        currentScanId = data.summary.scan_id;
+    }
+
     renderOverview(data);
     renderIPs(data);
     renderProtocols(data);
     renderAlerts(data);
+
+    // Enable/disable report buttons
+    if (currentScanId) {
+        $('#download-pdf-btn, #download-html-btn').prop('disabled', false);
+    } else {
+        $('#download-pdf-btn, #download-html-btn').prop('disabled', true);
+    }
 }
 
 // ==================== RENDERIZAÇÃO: VISÃO GERAL ====================
@@ -755,6 +780,25 @@ function renderIPs(data) {
             geoCell = '<span class="text-muted">Local</span>';
         }
 
+        // Reputação
+        let reputationCell = '<span class="text-muted">-</span>';
+        if (ip.reputation) {
+            const rep = ip.reputation;
+            const score = rep.reputation_score || 0;
+            let badgeClass = 'bg-success';
+            let label = 'Clean';
+            if (rep.is_malicious || score >= 70) {
+                badgeClass = 'bg-danger';
+                label = 'Malicious';
+            } else if (score >= 30) {
+                badgeClass = 'bg-warning text-dark';
+                label = 'Suspicious';
+            }
+            reputationCell = `<span class="badge ${badgeClass}" title="Score: ${score}/100">${label} (${score})</span>`;
+        } else if (ip.is_local) {
+            reputationCell = '<span class="text-muted">Local</span>';
+        }
+
         const row = `
             <tr>
                 <td><code>${ip.ip}</code></td>
@@ -762,6 +806,7 @@ function renderIPs(data) {
                 <td>${groupCell}</td>
                 <td>${typeLabel}</td>
                 <td>${geoCell}</td>
+                <td>${reputationCell}</td>
                 <td>${formatNumber(ip.packets_sent)}</td>
                 <td>${formatNumber(ip.packets_received)}</td>
                 <td>${formatBytes(ip.bytes_sent)}</td>
@@ -783,7 +828,7 @@ function renderIPs(data) {
     });
 
     ipsDataTable = $('#ips-table').DataTable({
-        order: [[7, 'desc']],  // Ordenar por bytes enviados
+        order: [[8, 'desc']],  // Ordenar por bytes enviados
         pageLength: 25,
         language: {
             url: '//cdn.datatables.net/plug-ins/1.13.6/i18n/pt-BR.json'
@@ -1213,6 +1258,10 @@ function loadSettings() {
                 $('#threshold-arp-gratuitous').val(thresholds.arp_gratuitous_max || 5);
                 $('#threshold-dns-subdomain').val(thresholds.dns_subdomain_length || 50);
                 $('#threshold-dns-entropy').val(thresholds.dns_entropy_min || 3.5);
+                $('#threshold-beaconing-connections').val(thresholds.beaconing_min_connections || 5);
+                $('#threshold-beaconing-jitter').val(thresholds.beaconing_max_jitter_percent || 10);
+                $('#threshold-brute-force-attempts').val(thresholds.brute_force_attempts || 10);
+                $('#threshold-brute-force-time').val(thresholds.brute_force_time_window || 60);
 
                 renderTrustedRanges(settings.trusted_ranges || []);
             }
@@ -1229,7 +1278,11 @@ function saveThresholds() {
         port_scan_time_window: parseInt($('#threshold-port-scan-time').val()),
         arp_gratuitous_max: parseInt($('#threshold-arp-gratuitous').val()),
         dns_subdomain_length: parseInt($('#threshold-dns-subdomain').val()),
-        dns_entropy_min: parseFloat($('#threshold-dns-entropy').val())
+        dns_entropy_min: parseFloat($('#threshold-dns-entropy').val()),
+        beaconing_min_connections: parseInt($('#threshold-beaconing-connections').val()),
+        beaconing_max_jitter_percent: parseFloat($('#threshold-beaconing-jitter').val()),
+        brute_force_attempts: parseInt($('#threshold-brute-force-attempts').val()),
+        brute_force_time_window: parseInt($('#threshold-brute-force-time').val())
     };
 
     $.ajax({
@@ -1347,6 +1400,174 @@ function clearAnalysis() {
             alert(error);
         }
     });
+}
+
+// ==================== PACKET VIEWER ====================
+
+function loadPackets(page) {
+    if (!currentScanId) {
+        alert('Nenhum scan selecionado');
+        return;
+    }
+
+    page = page || 1;
+    currentPacketPage = page;
+
+    const filterIp = $('#filter-packet-ip').val() || '';
+    const filterProtocol = $('#filter-packet-protocol').val() || '';
+    const perPage = 100;
+
+    let url = `/api/packets/${currentScanId}?page=${page}&per_page=${perPage}`;
+    if (filterIp) url += `&ip=${encodeURIComponent(filterIp)}`;
+    if (filterProtocol) url += `&protocol=${encodeURIComponent(filterProtocol)}`;
+
+    $('#packets-tbody').html('<tr><td colspan="8" class="text-center"><i class="fas fa-spinner fa-spin"></i> Carregando pacotes...</td></tr>');
+
+    $.ajax({
+        url: url,
+        type: 'GET',
+        success: function(response) {
+            if (response.success) {
+                renderPackets(response.data);
+                renderPacketPagination(response.pagination);
+            } else {
+                $('#packets-tbody').html('<tr><td colspan="8" class="text-center text-danger">' + (response.error || 'Erro ao carregar pacotes') + '</td></tr>');
+            }
+        },
+        error: function(xhr) {
+            const error = xhr.responseJSON?.error || 'Erro ao carregar pacotes';
+            $('#packets-tbody').html('<tr><td colspan="8" class="text-center text-danger">' + error + '</td></tr>');
+        }
+    });
+}
+
+function renderPackets(packets) {
+    const tbody = $('#packets-tbody');
+    tbody.empty();
+
+    if (!packets || packets.length === 0) {
+        tbody.html('<tr><td colspan="7" class="text-center text-muted">Nenhum pacote encontrado</td></tr>');
+        return;
+    }
+
+    packets.forEach(pkt => {
+        const row = `
+            <tr style="cursor: pointer;" onclick="viewPacketDetail(${pkt.number})">
+                <td>${pkt.number}</td>
+                <td><small>${pkt.time}</small></td>
+                <td><code>${pkt.src || '-'}</code></td>
+                <td><code>${pkt.dst || '-'}</code></td>
+                <td><span class="badge bg-info">${pkt.protocol || '-'}</span></td>
+                <td>${pkt.length}</td>
+                <td><small>${escapeHtml(pkt.info || '')}</small></td>
+                <td><button class="btn btn-sm btn-outline-primary" onclick="event.stopPropagation(); viewPacketDetail(${pkt.number})" title="Detalhes"><i class="fas fa-search"></i></button></td>
+            </tr>
+        `;
+        tbody.append(row);
+    });
+}
+
+function renderPacketPagination(pagination) {
+    if (!pagination) return;
+
+    $('#packet-page-info').text(`Página ${pagination.page} de ${pagination.total_pages} (${pagination.total} pacotes)`);
+
+    $('#packet-prev-page').prop('disabled', pagination.page <= 1);
+    $('#packet-next-page').prop('disabled', pagination.page >= pagination.total_pages);
+}
+
+function packetPagePrev() {
+    if (currentPacketPage > 1) {
+        loadPackets(currentPacketPage - 1);
+    }
+}
+
+function packetPageNext() {
+    loadPackets(currentPacketPage + 1);
+}
+
+function viewPacketDetail(packetNum) {
+    if (!currentScanId) return;
+
+    $.ajax({
+        url: `/api/packets/${currentScanId}/${packetNum}`,
+        type: 'GET',
+        success: function(response) {
+            if (response.success) {
+                renderPacketDetail(response.data);
+                new bootstrap.Modal('#packetDetailModal').show();
+            }
+        },
+        error: function(xhr) {
+            alert('Erro ao carregar detalhes do pacote');
+        }
+    });
+}
+
+function renderPacketDetail(detail) {
+    // Layers tab
+    const layersContainer = $('#packet-layers-content');
+    layersContainer.empty();
+
+    if (detail.layers && detail.layers.length > 0) {
+        detail.layers.forEach((layer, idx) => {
+            let fieldsHtml = '';
+            if (layer.fields) {
+                for (const [key, value] of Object.entries(layer.fields)) {
+                    fieldsHtml += `<tr><td><strong>${escapeHtml(key)}</strong></td><td>${escapeHtml(String(value))}</td></tr>`;
+                }
+            }
+
+            const layerHtml = `
+                <div class="card mb-2">
+                    <div class="card-header py-1 px-2" data-bs-toggle="collapse" data-bs-target="#layer-${idx}" style="cursor: pointer;">
+                        <strong>${escapeHtml(layer.name)}</strong>
+                    </div>
+                    <div id="layer-${idx}" class="collapse ${idx === 0 ? 'show' : ''}">
+                        <div class="card-body p-2">
+                            <table class="table table-sm table-striped mb-0">
+                                <tbody>${fieldsHtml}</tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            `;
+            layersContainer.append(layerHtml);
+        });
+    } else {
+        layersContainer.html('<p class="text-muted">Nenhuma camada disponível</p>');
+    }
+
+    // Hex dump tab
+    const hexContainer = $('#packet-hex-content');
+    if (detail.hex_dump) {
+        hexContainer.text(detail.hex_dump);
+    } else {
+        hexContainer.text('Hex dump não disponível');
+    }
+
+    // Modal title
+    $('#packet-detail-number').text(detail.number || '');
+}
+
+// ==================== REPORTS ====================
+
+function downloadReport(format) {
+    if (!currentScanId) {
+        alert('Nenhum scan selecionado para gerar relatório');
+        return;
+    }
+
+    const btn = format === 'pdf' ? $('#download-pdf-btn') : $('#download-html-btn');
+    const originalText = btn.html();
+    btn.prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Gerando...');
+
+    window.location.href = `/api/report/${currentScanId}?format=${format}`;
+
+    // Re-enable after a delay (download starts in background)
+    setTimeout(function() {
+        btn.prop('disabled', false).html(originalText);
+    }, 3000);
 }
 
 // ==================== UTILITÁRIOS ====================

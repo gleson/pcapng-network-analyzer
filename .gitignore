@@ -50,6 +50,10 @@ htmlcov/
 # Docker
 postgres_data/
 
+# Celery
+celerybeat-schedule
+celerybeat-schedule.db
+
 # Environment
 .env
 

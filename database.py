@@ -129,6 +129,20 @@ def init_database():
             )
         ''')
 
+        # Table for IP reputation cache (threat intelligence)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ip_reputation (
+                id SERIAL PRIMARY KEY,
+                ip_address TEXT UNIQUE NOT NULL,
+                reputation_score INTEGER DEFAULT 0,
+                is_malicious BOOLEAN DEFAULT FALSE,
+                abuse_confidence INTEGER DEFAULT 0,
+                sources TEXT,
+                last_seen TEXT,
+                cached_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
+
         # Create indexes for better performance
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_ip_stats_scan ON ip_stats(scan_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_ip_stats_ip ON ip_stats(ip_address)')
@@ -138,6 +152,7 @@ def init_database():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_protocol_ip_stats_proto ON protocol_ip_stats(protocol_name)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_scans_analyzed_at ON scans(analyzed_at)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_ip_geolocation_ip ON ip_geolocation(ip_address)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_ip_reputation_ip ON ip_reputation(ip_address)')
 
         conn.commit()
 
@@ -774,6 +789,79 @@ def get_ip_evolution(ip_address, limit=10):
             })
 
         return evolution
+
+
+# ==================== THREAT INTELLIGENCE OPERATIONS ====================
+
+def get_ip_reputation(ip_address):
+    """Get cached reputation for an IP (7-day TTL)"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT reputation_score, is_malicious, abuse_confidence,
+                   sources, last_seen, cached_at
+            FROM ip_reputation
+            WHERE ip_address = %s
+              AND cached_at > NOW() - INTERVAL '7 days'
+        ''', (ip_address,))
+        row = cursor.fetchone()
+        if row:
+            result = dict(row)
+            if hasattr(result.get('cached_at'), 'isoformat'):
+                result['cached_at'] = result['cached_at'].isoformat()
+            result['sources'] = json.loads(result.get('sources') or '[]')
+            return result
+        return None
+
+
+def save_ip_reputation(ip_address, reputation_data):
+    """Save reputation data for an IP"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO ip_reputation (
+                ip_address, reputation_score, is_malicious,
+                abuse_confidence, sources, last_seen, cached_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT(ip_address) DO UPDATE SET
+                reputation_score = EXCLUDED.reputation_score,
+                is_malicious = EXCLUDED.is_malicious,
+                abuse_confidence = EXCLUDED.abuse_confidence,
+                sources = EXCLUDED.sources,
+                last_seen = EXCLUDED.last_seen,
+                cached_at = NOW()
+        ''', (
+            ip_address,
+            reputation_data.get('reputation_score', 0),
+            reputation_data.get('is_malicious', False),
+            reputation_data.get('abuse_confidence', 0),
+            json.dumps(reputation_data.get('sources', [])),
+            reputation_data.get('last_seen')
+        ))
+        conn.commit()
+
+
+def get_all_ip_reputations():
+    """Get all cached reputations (within 7-day TTL)"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT ip_address, reputation_score, is_malicious,
+                   abuse_confidence, sources, last_seen
+            FROM ip_reputation
+            WHERE cached_at > NOW() - INTERVAL '7 days'
+        ''')
+        reps = {}
+        for row in cursor.fetchall():
+            reps[row['ip_address']] = {
+                'reputation_score': row['reputation_score'],
+                'is_malicious': row['is_malicious'],
+                'abuse_confidence': row['abuse_confidence'],
+                'sources': json.loads(row['sources'] or '[]'),
+                'last_seen': row['last_seen']
+            }
+        return reps
 
 
 # Initialize database on import
