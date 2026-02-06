@@ -1,33 +1,32 @@
 """
 Database module for PCAP Network Analyzer
-Manages SQLite database for storing scan history and IP names
+Manages PostgreSQL database for storing scan history, IP names and geolocation
 """
 
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import json
 import os
 from datetime import datetime
 from contextlib import contextmanager
 import ipaddress
 
-DATABASE_FILE = 'data/analyzer.db'
+DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://pcap_user:pcap_pass@localhost:5432/pcap_analyzer')
 
 
 def init_database():
     """Initialize database and create tables if they don't exist"""
-    os.makedirs('data', exist_ok=True)
-
     with get_connection() as conn:
         cursor = conn.cursor()
 
         # Table for scans (captures)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS scans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 filename TEXT NOT NULL,
-                analyzed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                analyzed_at TIMESTAMPTZ DEFAULT NOW(),
                 packet_count INTEGER DEFAULT 0,
-                total_bytes INTEGER DEFAULT 0,
+                total_bytes BIGINT DEFAULT 0,
                 duration REAL DEFAULT 0,
                 start_time TEXT,
                 end_time TEXT,
@@ -41,26 +40,26 @@ def init_database():
         # Table for IP names (user-defined names for known hosts)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS ip_names (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 ip_address TEXT UNIQUE NOT NULL,
                 name TEXT NOT NULL,
                 description TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
 
         # Table for IP statistics per scan
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS ip_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 scan_id INTEGER NOT NULL,
                 ip_address TEXT NOT NULL,
-                is_local BOOLEAN DEFAULT 0,
+                is_local BOOLEAN DEFAULT FALSE,
                 packets_sent INTEGER DEFAULT 0,
                 packets_received INTEGER DEFAULT 0,
-                bytes_sent INTEGER DEFAULT 0,
-                bytes_received INTEGER DEFAULT 0,
+                bytes_sent BIGINT DEFAULT 0,
+                bytes_received BIGINT DEFAULT 0,
                 protocols TEXT,
                 ports TEXT,
                 alert_count INTEGER DEFAULT 0,
@@ -71,7 +70,7 @@ def init_database():
         # Table for alerts per scan
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 scan_id INTEGER NOT NULL,
                 severity TEXT NOT NULL,
                 category TEXT NOT NULL,
@@ -88,11 +87,11 @@ def init_database():
         # Table for protocol stats per scan
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS protocol_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 scan_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 packets INTEGER DEFAULT 0,
-                bytes INTEGER DEFAULT 0,
+                bytes BIGINT DEFAULT 0,
                 percentage REAL DEFAULT 0,
                 risk_level TEXT,
                 warning TEXT,
@@ -103,14 +102,30 @@ def init_database():
         # Table for protocol-IP statistics (IPs per protocol with stats)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS protocol_ip_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 scan_id INTEGER NOT NULL,
                 protocol_name TEXT NOT NULL,
                 ip_address TEXT NOT NULL,
                 packets INTEGER DEFAULT 0,
-                bytes INTEGER DEFAULT 0,
-                is_local BOOLEAN DEFAULT 0,
+                bytes BIGINT DEFAULT 0,
+                is_local BOOLEAN DEFAULT FALSE,
                 FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE
+            )
+        ''')
+
+        # Table for IP geolocation cache
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ip_geolocation (
+                id SERIAL PRIMARY KEY,
+                ip_address TEXT UNIQUE NOT NULL,
+                country TEXT,
+                country_code TEXT,
+                city TEXT,
+                region TEXT,
+                lat REAL,
+                lon REAL,
+                isp TEXT,
+                cached_at TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
 
@@ -121,6 +136,8 @@ def init_database():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_protocol_stats_scan ON protocol_stats(scan_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_protocol_ip_stats_scan ON protocol_ip_stats(scan_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_protocol_ip_stats_proto ON protocol_ip_stats(protocol_name)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_scans_analyzed_at ON scans(analyzed_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_ip_geolocation_ip ON ip_geolocation(ip_address)')
 
         conn.commit()
 
@@ -128,10 +145,12 @@ def init_database():
 @contextmanager
 def get_connection():
     """Context manager for database connections"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         yield conn
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -157,7 +176,8 @@ def save_scan(results, filename):
                 filename, analyzed_at, packet_count, total_bytes, duration,
                 start_time, end_time, ip_count, protocol_count, alert_count,
                 results_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
         ''', (
             filename,
             summary.get('analyzed_at', datetime.now().isoformat()),
@@ -172,7 +192,7 @@ def save_scan(results, filename):
             json.dumps(results)
         ))
 
-        scan_id = cursor.lastrowid
+        scan_id = cursor.fetchone()['id']
 
         # Insert IP stats
         for ip_data in ips:
@@ -180,7 +200,7 @@ def save_scan(results, filename):
                 INSERT INTO ip_stats (
                     scan_id, ip_address, is_local, packets_sent, packets_received,
                     bytes_sent, bytes_received, protocols, ports, alert_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ''', (
                 scan_id,
                 ip_data.get('ip'),
@@ -200,7 +220,7 @@ def save_scan(results, filename):
                 INSERT INTO alerts (
                     scan_id, severity, category, title, description,
                     ip_address, details, recommendation, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ''', (
                 scan_id,
                 alert.get('severity'),
@@ -218,7 +238,7 @@ def save_scan(results, filename):
             cursor.execute('''
                 INSERT INTO protocol_stats (
                     scan_id, name, packets, bytes, percentage, risk_level, warning
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
             ''', (
                 scan_id,
                 proto.get('name'),
@@ -236,7 +256,7 @@ def save_scan(results, filename):
                 cursor.execute('''
                     INSERT INTO protocol_ip_stats (
                         scan_id, protocol_name, ip_address, packets, bytes, is_local
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
                 ''', (
                     scan_id,
                     proto_name,
@@ -250,23 +270,42 @@ def save_scan(results, filename):
         return scan_id
 
 
-def get_all_scans():
-    """Get list of all scans (summary only)"""
+def get_all_scans(date_from=None, date_to=None):
+    """Get list of all scans (summary only), optionally filtered by date range"""
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute('''
+
+        query = '''
             SELECT id, filename, analyzed_at, packet_count, total_bytes,
                    duration, ip_count, protocol_count, alert_count
             FROM scans
-            ORDER BY analyzed_at DESC
-        ''')
+        '''
+        params = []
+        conditions = []
+
+        if date_from:
+            conditions.append('analyzed_at >= %s')
+            params.append(date_from)
+        if date_to:
+            conditions.append('analyzed_at <= %s')
+            params.append(date_to + ' 23:59:59')
+
+        if conditions:
+            query += ' WHERE ' + ' AND '.join(conditions)
+
+        query += ' ORDER BY analyzed_at DESC'
+
+        cursor.execute(query, params)
 
         scans = []
         for row in cursor.fetchall():
+            analyzed_at = row['analyzed_at']
+            if hasattr(analyzed_at, 'isoformat'):
+                analyzed_at = analyzed_at.isoformat()
             scans.append({
                 'id': row['id'],
                 'filename': row['filename'],
-                'analyzed_at': row['analyzed_at'],
+                'analyzed_at': analyzed_at,
                 'packet_count': row['packet_count'],
                 'total_bytes': row['total_bytes'],
                 'duration': row['duration'],
@@ -282,7 +321,7 @@ def get_scan_by_id(scan_id):
     """Get full scan results by ID"""
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute('SELECT results_json FROM scans WHERE id = ?', (scan_id,))
+        cursor.execute('SELECT results_json FROM scans WHERE id = %s', (scan_id,))
         row = cursor.fetchone()
 
         if row:
@@ -291,12 +330,30 @@ def get_scan_by_id(scan_id):
 
 
 def delete_scan(scan_id):
-    """Delete a scan and all related data"""
+    """Delete a scan and all related data. Returns the filename if deleted, None otherwise."""
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute('DELETE FROM scans WHERE id = ?', (scan_id,))
+        cursor.execute('SELECT filename FROM scans WHERE id = %s', (scan_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        filename = row['filename']
+        cursor.execute('DELETE FROM scans WHERE id = %s', (scan_id,))
         conn.commit()
-        return cursor.rowcount > 0
+        return filename
+
+
+def delete_multiple_scans(scan_ids):
+    """Delete multiple scans and all related data. Returns list of filenames deleted."""
+    if not scan_ids:
+        return []
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT filename FROM scans WHERE id = ANY(%s)', (scan_ids,))
+        filenames = [row['filename'] for row in cursor.fetchall()]
+        cursor.execute('DELETE FROM scans WHERE id = ANY(%s)', (scan_ids,))
+        conn.commit()
+        return filenames
 
 
 # ==================== IP NAME OPERATIONS ====================
@@ -305,7 +362,7 @@ def get_ip_name(ip_address):
     """Get the name for a specific IP"""
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute('SELECT name, description FROM ip_names WHERE ip_address = ?', (ip_address,))
+        cursor.execute('SELECT name, description FROM ip_names WHERE ip_address = %s', (ip_address,))
         row = cursor.fetchone()
 
         if row:
@@ -335,11 +392,11 @@ def set_ip_name(ip_address, name, description=None):
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO ip_names (ip_address, name, description, updated_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (%s, %s, %s, NOW())
             ON CONFLICT(ip_address) DO UPDATE SET
-                name = excluded.name,
-                description = excluded.description,
-                updated_at = CURRENT_TIMESTAMP
+                name = EXCLUDED.name,
+                description = EXCLUDED.description,
+                updated_at = NOW()
         ''', (ip_address, name, description))
         conn.commit()
         return True
@@ -349,9 +406,83 @@ def delete_ip_name(ip_address):
     """Delete the name for an IP"""
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute('DELETE FROM ip_names WHERE ip_address = ?', (ip_address,))
+        cursor.execute('DELETE FROM ip_names WHERE ip_address = %s', (ip_address,))
+        deleted = cursor.rowcount > 0
         conn.commit()
-        return cursor.rowcount > 0
+        return deleted
+
+
+# ==================== GEOLOCATION OPERATIONS ====================
+
+def get_ip_geolocation(ip_address):
+    """Get cached geolocation for an IP"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT country, country_code, city, region, lat, lon, isp, cached_at
+            FROM ip_geolocation
+            WHERE ip_address = %s
+              AND cached_at > NOW() - INTERVAL '7 days'
+        ''', (ip_address,))
+        row = cursor.fetchone()
+        if row:
+            result = dict(row)
+            if hasattr(result.get('cached_at'), 'isoformat'):
+                result['cached_at'] = result['cached_at'].isoformat()
+            return result
+        return None
+
+
+def get_all_ip_geolocations():
+    """Get all cached geolocations"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT ip_address, country, country_code, city, region, lat, lon, isp
+            FROM ip_geolocation
+            WHERE cached_at > NOW() - INTERVAL '7 days'
+        ''')
+        geos = {}
+        for row in cursor.fetchall():
+            geos[row['ip_address']] = {
+                'country': row['country'],
+                'country_code': row['country_code'],
+                'city': row['city'],
+                'region': row['region'],
+                'lat': row['lat'],
+                'lon': row['lon'],
+                'isp': row['isp']
+            }
+        return geos
+
+
+def save_ip_geolocation(ip_address, geo_data):
+    """Save geolocation data for an IP"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO ip_geolocation (ip_address, country, country_code, city, region, lat, lon, isp, cached_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT(ip_address) DO UPDATE SET
+                country = EXCLUDED.country,
+                country_code = EXCLUDED.country_code,
+                city = EXCLUDED.city,
+                region = EXCLUDED.region,
+                lat = EXCLUDED.lat,
+                lon = EXCLUDED.lon,
+                isp = EXCLUDED.isp,
+                cached_at = NOW()
+        ''', (
+            ip_address,
+            geo_data.get('country'),
+            geo_data.get('countryCode'),
+            geo_data.get('city'),
+            geo_data.get('regionName'),
+            geo_data.get('lat'),
+            geo_data.get('lon'),
+            geo_data.get('isp')
+        ))
+        conn.commit()
 
 
 # ==================== AGGREGATE STATISTICS ====================
@@ -374,10 +505,10 @@ def get_ip_in_range(ip_str, trusted_ranges):
     return None
 
 
-def get_aggregated_results(scan_ids=None, trusted_ranges=None):
+def get_aggregated_results(scan_ids=None, trusted_ranges=None, date_from=None, date_to=None):
     """
     Get aggregated results from multiple scans
-    If scan_ids is None, aggregates all scans
+    If scan_ids is None, aggregates all scans (optionally filtered by date range)
     """
     trusted_ranges = trusted_ranges or []
     ip_names = get_all_ip_names()
@@ -385,36 +516,59 @@ def get_aggregated_results(scan_ids=None, trusted_ranges=None):
     with get_connection() as conn:
         cursor = conn.cursor()
 
-        # Build WHERE clause
-        where_clause = ''
-        params = []
+        # Build WHERE clause for scan filtering
+        scan_conditions = []
+        scan_params = []
         if scan_ids:
-            placeholders = ','.join('?' * len(scan_ids))
-            where_clause = f'WHERE scan_id IN ({placeholders})'
-            params = scan_ids
+            scan_conditions.append('id = ANY(%s)')
+            scan_params.append(scan_ids)
+        if date_from:
+            scan_conditions.append('analyzed_at >= %s')
+            scan_params.append(date_from)
+        if date_to:
+            scan_conditions.append('analyzed_at <= %s')
+            scan_params.append(date_to + ' 23:59:59')
+
+        scan_where = ''
+        if scan_conditions:
+            scan_where = 'WHERE ' + ' AND '.join(scan_conditions)
+
+        # Get matching scan IDs (for use in subqueries)
+        cursor.execute(f'SELECT id FROM scans {scan_where}', scan_params)
+        filtered_scan_ids = [row['id'] for row in cursor.fetchall()]
+
+        if not filtered_scan_ids:
+            return {
+                'summary': {
+                    'scan_count': 0,
+                    'packet_count': 0,
+                    'total_bytes': 0,
+                    'duration': 0,
+                    'first_scan': None,
+                    'last_scan': None,
+                    'analyzed_at': datetime.now().isoformat()
+                },
+                'ips': [],
+                'protocols': [],
+                'alerts': [],
+                'protocol_ips': {},
+                'traffic_timeline': []
+            }
+
+        # Use filtered IDs for all subsequent queries
+        where_clause = 'WHERE scan_id = ANY(%s)'
+        params = [filtered_scan_ids]
 
         # Get scan info
-        if scan_ids:
-            scan_where = f'WHERE id IN ({",".join("?" * len(scan_ids))})'
-            cursor.execute(f'''
-                SELECT COUNT(*) as scan_count,
-                       SUM(packet_count) as total_packets,
-                       SUM(total_bytes) as total_bytes,
-                       SUM(duration) as total_duration,
-                       MIN(start_time) as first_scan,
-                       MAX(end_time) as last_scan
-                FROM scans {scan_where}
-            ''', scan_ids)
-        else:
-            cursor.execute('''
-                SELECT COUNT(*) as scan_count,
-                       SUM(packet_count) as total_packets,
-                       SUM(total_bytes) as total_bytes,
-                       SUM(duration) as total_duration,
-                       MIN(start_time) as first_scan,
-                       MAX(end_time) as last_scan
-                FROM scans
-            ''')
+        cursor.execute(f'''
+            SELECT COUNT(*) as scan_count,
+                   SUM(packet_count) as total_packets,
+                   SUM(total_bytes) as total_bytes,
+                   SUM(duration) as total_duration,
+                   MIN(start_time) as first_scan,
+                   MAX(end_time) as last_scan
+            FROM scans {scan_where}
+        ''', scan_params)
 
         scan_summary = cursor.fetchone()
 
@@ -422,7 +576,7 @@ def get_aggregated_results(scan_ids=None, trusted_ranges=None):
         cursor.execute(f'''
             SELECT
                 ip_address,
-                MAX(is_local) as is_local,
+                bool_or(is_local) as is_local,
                 SUM(packets_sent) as packets_sent,
                 SUM(packets_received) as packets_received,
                 SUM(bytes_sent) as bytes_sent,
@@ -432,30 +586,23 @@ def get_aggregated_results(scan_ids=None, trusted_ranges=None):
             FROM ip_stats
             {where_clause}
             GROUP BY ip_address
-            ORDER BY bytes_sent + bytes_received DESC
+            ORDER BY SUM(bytes_sent) + SUM(bytes_received) DESC
         ''', params)
 
         ips = []
-        all_protocols = set()
-
         for row in cursor.fetchall():
             ip_addr = row['ip_address']
 
             # Get protocols from all scans for this IP
-            if scan_ids:
-                cursor.execute(f'''
-                    SELECT protocols FROM ip_stats
-                    WHERE ip_address = ? AND scan_id IN ({",".join("?" * len(scan_ids))})
-                ''', [ip_addr] + scan_ids)
-            else:
-                cursor.execute('SELECT protocols FROM ip_stats WHERE ip_address = ?', (ip_addr,))
+            cursor.execute('''
+                SELECT protocols FROM ip_stats
+                WHERE ip_address = %s AND scan_id = ANY(%s)
+            ''', (ip_addr, filtered_scan_ids))
 
-            protocols = set()
+            protocols_set = set()
             for proto_row in cursor.fetchall():
                 proto_list = json.loads(proto_row['protocols'] or '[]')
-                protocols.update(proto_list)
-
-            all_protocols.update(protocols)
+                protocols_set.update(proto_list)
 
             # Get name and group for this IP
             ip_info = ip_names.get(ip_addr, {})
@@ -471,12 +618,19 @@ def get_aggregated_results(scan_ids=None, trusted_ranges=None):
                 'packets_received': row['packets_received'],
                 'bytes_sent': row['bytes_sent'],
                 'bytes_received': row['bytes_received'],
-                'protocols': list(protocols),
+                'protocols': list(protocols_set),
                 'alert_count': row['alert_count'],
                 'scan_count': row['scan_count']
             })
 
-        # Aggregate protocol stats
+        # Aggregate protocol stats - first get total bytes
+        cursor.execute(f'''
+            SELECT SUM(bytes) as total_bytes
+            FROM protocol_stats
+            {where_clause}
+        ''', params)
+        total_bytes = cursor.fetchone()['total_bytes'] or 0
+
         cursor.execute(f'''
             SELECT
                 name,
@@ -487,24 +641,10 @@ def get_aggregated_results(scan_ids=None, trusted_ranges=None):
             FROM protocol_stats
             {where_clause}
             GROUP BY name
-            ORDER BY bytes DESC
+            ORDER BY SUM(bytes) DESC
         ''', params)
 
         protocols = []
-        total_bytes = sum(row['bytes'] or 0 for row in cursor.fetchall())
-        cursor.execute(f'''
-            SELECT
-                name,
-                SUM(packets) as packets,
-                SUM(bytes) as bytes,
-                MAX(risk_level) as risk_level,
-                MAX(warning) as warning
-            FROM protocol_stats
-            {where_clause}
-            GROUP BY name
-            ORDER BY bytes DESC
-        ''', params)
-
         for row in cursor.fetchall():
             percentage = (row['bytes'] / total_bytes * 100) if total_bytes > 0 else 0
             protocols.append({
@@ -524,7 +664,7 @@ def get_aggregated_results(scan_ids=None, trusted_ranges=None):
                 s.filename
             FROM alerts a
             JOIN scans s ON a.scan_id = s.id
-            {where_clause.replace('scan_id', 'a.scan_id') if where_clause else ''}
+            WHERE a.scan_id = ANY(%s)
             ORDER BY
                 CASE a.severity
                     WHEN 'critical' THEN 1
@@ -534,7 +674,7 @@ def get_aggregated_results(scan_ids=None, trusted_ranges=None):
                     ELSE 5
                 END,
                 a.timestamp DESC
-        ''', params)
+        ''', (filtered_scan_ids,))
 
         alerts = []
         for row in cursor.fetchall():
@@ -557,11 +697,11 @@ def get_aggregated_results(scan_ids=None, trusted_ranges=None):
                 ip_address,
                 SUM(packets) as packets,
                 SUM(bytes) as bytes,
-                MAX(is_local) as is_local
+                bool_or(is_local) as is_local
             FROM protocol_ip_stats
-            {where_clause.replace('scan_id', 'scan_id') if where_clause else ''}
+            {where_clause}
             GROUP BY protocol_name, ip_address
-            ORDER BY protocol_name, bytes DESC
+            ORDER BY protocol_name, SUM(bytes) DESC
         ''', params)
 
         protocol_ips = {}
@@ -590,7 +730,7 @@ def get_aggregated_results(scan_ids=None, trusted_ranges=None):
             'protocols': protocols,
             'alerts': alerts,
             'protocol_ips': protocol_ips,
-            'traffic_timeline': []  # Not aggregated for simplicity
+            'traffic_timeline': []
         }
 
 
@@ -612,17 +752,20 @@ def get_ip_evolution(ip_address, limit=10):
                 i.alert_count
             FROM ip_stats i
             JOIN scans s ON i.scan_id = s.id
-            WHERE i.ip_address = ?
+            WHERE i.ip_address = %s
             ORDER BY s.analyzed_at DESC
-            LIMIT ?
+            LIMIT %s
         ''', (ip_address, limit))
 
         evolution = []
         for row in cursor.fetchall():
+            analyzed_at = row['analyzed_at']
+            if hasattr(analyzed_at, 'isoformat'):
+                analyzed_at = analyzed_at.isoformat()
             evolution.append({
                 'scan_id': row['scan_id'],
                 'filename': row['filename'],
-                'analyzed_at': row['analyzed_at'],
+                'analyzed_at': analyzed_at,
                 'packets_sent': row['packets_sent'],
                 'packets_received': row['packets_received'],
                 'bytes_sent': row['bytes_sent'],

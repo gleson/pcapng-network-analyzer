@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="pt-BR" data-theme="light">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -24,9 +24,14 @@
             <span class="navbar-brand mb-0 h1">
                 <i class="fas fa-network-wired"></i> PCAP Network Analyzer
             </span>
-            <span class="text-light" id="status-indicator">
-                <i class="fas fa-circle text-secondary"></i> <span id="status-text">Idle</span>
-            </span>
+            <div class="d-flex align-items-center gap-3">
+                <button class="btn btn-sm btn-outline-light" id="theme-toggle-btn" onclick="toggleTheme()" title="Alternar tema">
+                    <i class="fas fa-moon" id="theme-icon"></i>
+                </button>
+                <span class="text-light" id="status-indicator">
+                    <i class="fas fa-circle text-secondary"></i> <span id="status-text">Idle</span>
+                </span>
+            </div>
         </div>
     </nav>
 
@@ -80,6 +85,29 @@
                         </div>
                     </div>
                     <div class="card-body">
+                        <!-- Date Filter -->
+                        <div class="row mb-3" id="date-filter-section">
+                            <div class="col-md-3">
+                                <label class="form-label small"><i class="fas fa-calendar"></i> Data Inicial</label>
+                                <input type="date" class="form-control form-control-sm" id="filter-date-from">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label small"><i class="fas fa-calendar"></i> Data Final</label>
+                                <input type="date" class="form-control form-control-sm" id="filter-date-to">
+                            </div>
+                            <div class="col-md-3 d-flex align-items-end gap-2">
+                                <button class="btn btn-sm btn-primary" id="apply-date-filter-btn" onclick="applyDateFilter()">
+                                    <i class="fas fa-filter"></i> Filtrar
+                                </button>
+                                <button class="btn btn-sm btn-outline-secondary" id="clear-date-filter-btn" onclick="clearDateFilter()">
+                                    <i class="fas fa-times"></i> Limpar
+                                </button>
+                            </div>
+                            <div class="col-md-3 d-flex align-items-end">
+                                <small class="text-muted" id="filter-status-text"></small>
+                            </div>
+                        </div>
+
                         <div id="scan-history-content">
                             <div class="table-responsive">
                                 <table class="table table-sm table-hover" id="scans-table">
@@ -110,6 +138,9 @@
                                 </button>
                                 <button class="btn btn-sm btn-info" id="view-all-btn">
                                     <i class="fas fa-globe"></i> Ver Todos (Agregado)
+                                </button>
+                                <button class="btn btn-sm btn-danger" id="delete-selected-btn" onclick="deleteSelectedScans()">
+                                    <i class="fas fa-trash-alt"></i> Excluir Selecionados
                                 </button>
                             </div>
                         </div>
@@ -283,6 +314,7 @@
                                         <th>Nome</th>
                                         <th>Grupo</th>
                                         <th>Tipo</th>
+                                        <th>Localização</th>
                                         <th>Pacotes Env.</th>
                                         <th>Pacotes Rec.</th>
                                         <th>Bytes Env.</th>

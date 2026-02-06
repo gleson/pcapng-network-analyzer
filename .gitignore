@@ -46,3 +46,12 @@ instance/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Docker
+postgres_data/
+
+# Environment
+.env
+
+# vibecode
+.claude

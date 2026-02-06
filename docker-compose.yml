@@ -1,0 +1,36 @@
+services:
+  web:
+    build: .
+    ports:
+      - "5000:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://pcap_user:pcap_pass@db:5432/pcap_analyzer
+      - UPLOAD_FOLDER=/app/data/uploads
+      - FLASK_ENV=production
+    volumes:
+      - uploads_data:/app/data/uploads
+      - settings_data:/app/data/settings
+    restart: unless-stopped
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=pcap_analyzer
+      - POSTGRES_USER=pcap_user
+      - POSTGRES_PASSWORD=pcap_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pcap_user -d pcap_analyzer"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  uploads_data:
+  settings_data:

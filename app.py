@@ -1,13 +1,14 @@
 """
 PCAP Network Analyzer - Flask Web Application
 Servidor web para análise de arquivos PCAP/PCAPNG
-Com suporte a banco de dados para histórico de scans
+Com suporte a PostgreSQL para histórico de scans
 """
 
 import os
 import json
 import threading
 import time
+import requests as http_requests
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
@@ -17,11 +18,12 @@ import database as db
 app = Flask(__name__)
 
 # Configurações
-app.config['UPLOAD_FOLDER'] = 'data/uploads'
+UPLOAD_FOLDER = os.environ.get('UPLOAD_FOLDER', 'data/uploads')
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB
 app.config['ALLOWED_EXTENSIONS'] = {'pcap', 'pcapng'}
 
-SETTINGS_FILE = 'data/settings.json'
+SETTINGS_FILE = os.environ.get('SETTINGS_FILE', 'data/settings.json')
 RESULTS_FILE = 'data/results.json'
 
 # Estado global da análise
@@ -57,6 +59,7 @@ def load_settings():
 def save_settings(settings):
     """Salva configurações no arquivo JSON"""
     try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE) or '.', exist_ok=True)
         with open(SETTINGS_FILE, 'w') as f:
             json.dump(settings, f, indent=4)
         return True
@@ -90,9 +93,10 @@ def save_results(results):
 
 def enrich_results_with_names_and_groups(results, settings):
     """
-    Enrich results with IP names and group (range description)
+    Enrich results with IP names, groups and geolocation
     """
     ip_names = db.get_all_ip_names()
+    ip_geos = db.get_all_ip_geolocations()
     trusted_ranges = settings.get('trusted_ranges', [])
 
     for ip_data in results.get('ips', []):
@@ -106,6 +110,11 @@ def enrich_results_with_names_and_groups(results, settings):
         group = db.get_ip_in_range(ip_addr, trusted_ranges)
         ip_data['group'] = group or ''
 
+        # Add geolocation
+        geo = ip_geos.get(ip_addr)
+        if geo:
+            ip_data['geolocation'] = geo
+
     # Also enrich protocol_ips if present
     protocol_ips = results.get('protocol_ips', {})
     for proto_name, ip_list in protocol_ips.items():
@@ -115,6 +124,37 @@ def enrich_results_with_names_and_groups(results, settings):
             ip_data['name'] = ip_info.get('name', '')
 
     return results
+
+
+def geolocate_ips(results):
+    """
+    Geolocate external IPs using ip-api.com (free, 45 req/min)
+    Results are cached in the database for 7 days
+    """
+    external_ips = [
+        ip_data['ip'] for ip_data in results.get('ips', [])
+        if not ip_data.get('is_local', True)
+    ]
+
+    for ip_addr in external_ips:
+        # Check cache first
+        cached = db.get_ip_geolocation(ip_addr)
+        if cached:
+            continue
+
+        try:
+            resp = http_requests.get(
+                f'http://ip-api.com/json/{ip_addr}',
+                timeout=5
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('status') == 'success':
+                    db.save_ip_geolocation(ip_addr, data)
+            # Rate limiting: ip-api.com allows 45 req/min
+            time.sleep(1.5)
+        except Exception as e:
+            print(f"Geolocation error for {ip_addr}: {e}")
 
 
 def analyze_pcap_background(filepath, filename):
@@ -147,11 +187,18 @@ def analyze_pcap_background(filepath, filename):
 
         # Atualizar progresso
         with analysis_lock:
-            analysis_status["progress"] = 80
+            analysis_status["progress"] = 70
             analysis_status["message"] = "Running security detections..."
 
         # Salvar no banco de dados
         scan_id = db.save_scan(results, filename)
+
+        # Geolocalizar IPs externos
+        with analysis_lock:
+            analysis_status["progress"] = 85
+            analysis_status["message"] = "Geolocating external IPs..."
+
+        geolocate_ips(results)
 
         # Enriquecer com nomes e grupos
         results = enrich_results_with_names_and_groups(results, settings)
@@ -264,10 +311,14 @@ def get_results():
     - scan_id: ID do scan específico (opcional)
     - view: 'single' ou 'aggregate' (default: single)
     - scan_ids: lista de IDs para agregação (comma-separated)
+    - date_from: filtro de data inicial (YYYY-MM-DD)
+    - date_to: filtro de data final (YYYY-MM-DD)
     """
     scan_id = request.args.get('scan_id', type=int)
     view = request.args.get('view', 'single')
     scan_ids_param = request.args.get('scan_ids', '')
+    date_from = request.args.get('date_from', '')
+    date_to = request.args.get('date_to', '')
 
     settings = load_settings()
 
@@ -278,7 +329,12 @@ def get_results():
             if scan_ids_param:
                 scan_ids = [int(x) for x in scan_ids_param.split(',')]
 
-            results = db.get_aggregated_results(scan_ids, settings.get('trusted_ranges', []))
+            results = db.get_aggregated_results(
+                scan_ids,
+                settings.get('trusted_ranges', []),
+                date_from=date_from or None,
+                date_to=date_to or None
+            )
 
             if not results['ips']:
                 return jsonify({
@@ -343,9 +399,15 @@ def get_results():
 
 @app.route('/api/scans', methods=['GET'])
 def get_scans():
-    """Retorna lista de todos os scans"""
+    """Retorna lista de todos os scans, com filtro opcional por período"""
     try:
-        scans = db.get_all_scans()
+        date_from = request.args.get('date_from', '')
+        date_to = request.args.get('date_to', '')
+
+        scans = db.get_all_scans(
+            date_from=date_from or None,
+            date_to=date_to or None
+        )
         return jsonify({
             "success": True,
             "data": scans
@@ -359,18 +421,54 @@ def get_scans():
 
 @app.route('/api/scans/<int:scan_id>', methods=['DELETE'])
 def delete_scan(scan_id):
-    """Remove um scan do histórico"""
+    """Remove um scan do histórico e o arquivo PCAP do disco"""
     try:
-        if db.delete_scan(scan_id):
+        filename = db.delete_scan(scan_id)
+        if filename:
+            # Remover arquivo PCAP do disco
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            if os.path.exists(file_path):
+                os.remove(file_path)
             return jsonify({
                 "success": True,
-                "message": "Scan deleted successfully"
+                "message": "Scan excluído com sucesso"
             })
         else:
             return jsonify({
                 "success": False,
                 "error": "Scan not found"
             }), 404
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/api/scans/batch', methods=['DELETE'])
+def delete_multiple_scans():
+    """Remove múltiplos scans do histórico e os arquivos PCAP do disco"""
+    try:
+        data = request.get_json()
+        scan_ids = data.get('ids', [])
+        if not scan_ids:
+            return jsonify({
+                "success": False,
+                "error": "Nenhum scan selecionado"
+            }), 400
+
+        filenames = db.delete_multiple_scans(scan_ids)
+        # Remover arquivos PCAP do disco
+        for filename in filenames:
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+        return jsonify({
+            "success": True,
+            "message": f"{len(filenames)} scan(s) excluído(s) com sucesso",
+            "deleted_count": len(filenames)
+        })
     except Exception as e:
         return jsonify({
             "success": False,
@@ -699,7 +797,7 @@ if __name__ == '__main__':
     print("=" * 60)
     print("Server running at: http://localhost:5000")
     print("Upload a .pcap or .pcapng file to begin analysis")
-    print("Database: data/analyzer.db")
+    print(f"Database: {os.environ.get('DATABASE_URL', 'PostgreSQL')}")
     print("=" * 60)
 
     app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)

@@ -1,7 +1,7 @@
 /**
  * PCAP Network Analyzer - Frontend JavaScript
  * Gerencia upload, análise e visualização de resultados
- * Com suporte a banco de dados e histórico de scans
+ * Com suporte a PostgreSQL, dark mode, filtro por período e geolocalização
  */
 
 // Estado global
@@ -18,6 +18,9 @@ let selectedScanIds = [];
 
 $(document).ready(function() {
     console.log('PCAP Analyzer initialized');
+
+    // Carregar tema salvo
+    loadTheme();
 
     // Event listeners - Upload
     $('#pcap-file').on('change', handleFileSelect);
@@ -74,6 +77,86 @@ $(document).ready(function() {
     checkForResults();
 });
 
+// ==================== DARK MODE ====================
+
+function toggleTheme() {
+    const html = document.documentElement;
+    const currentTheme = html.getAttribute('data-theme');
+    const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+
+    html.setAttribute('data-theme', newTheme);
+    localStorage.setItem('pcap-analyzer-theme', newTheme);
+    updateThemeIcon(newTheme);
+    updateChartColors(newTheme);
+}
+
+function loadTheme() {
+    const savedTheme = localStorage.getItem('pcap-analyzer-theme') || 'light';
+    document.documentElement.setAttribute('data-theme', savedTheme);
+    updateThemeIcon(savedTheme);
+}
+
+function updateThemeIcon(theme) {
+    const icon = document.getElementById('theme-icon');
+    if (icon) {
+        icon.className = theme === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
+    }
+}
+
+function updateChartColors(theme) {
+    const textColor = theme === 'dark' ? '#e0e0e0' : '#666';
+    const gridColor = theme === 'dark' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)';
+
+    if (trafficChart) {
+        trafficChart.options.scales.x.ticks.color = textColor;
+        trafficChart.options.scales.y.ticks.color = textColor;
+        trafficChart.options.scales.x.grid.color = gridColor;
+        trafficChart.options.scales.y.grid.color = gridColor;
+        trafficChart.update();
+    }
+    if (protocolChart) {
+        protocolChart.options.plugins.legend.labels.color = textColor;
+        protocolChart.update();
+    }
+}
+
+// ==================== DATE FILTER ====================
+
+function applyDateFilter() {
+    const dateFrom = $('#filter-date-from').val();
+    const dateTo = $('#filter-date-to').val();
+
+    if (!dateFrom && !dateTo) {
+        alert('Selecione pelo menos uma data para filtrar.');
+        return;
+    }
+
+    loadScanHistory(dateFrom, dateTo);
+
+    // Mostrar indicação do filtro ativo
+    let filterText = 'Filtro ativo: ';
+    if (dateFrom && dateTo) {
+        filterText += `${formatDateBR(dateFrom)} a ${formatDateBR(dateTo)}`;
+    } else if (dateFrom) {
+        filterText += `a partir de ${formatDateBR(dateFrom)}`;
+    } else {
+        filterText += `até ${formatDateBR(dateTo)}`;
+    }
+    $('#filter-status-text').text(filterText).addClass('text-primary');
+}
+
+function clearDateFilter() {
+    $('#filter-date-from').val('');
+    $('#filter-date-to').val('');
+    $('#filter-status-text').text('').removeClass('text-primary');
+    loadScanHistory();
+}
+
+function formatDateBR(dateStr) {
+    const parts = dateStr.split('-');
+    return `${parts[2]}/${parts[1]}/${parts[0]}`;
+}
+
 // ==================== VIEW MODE ====================
 
 function setViewMode(mode) {
@@ -110,15 +193,24 @@ function viewSelectedScans() {
         return;
     }
 
-    loadResults(null, 'aggregate', selectedScanIds);
+    const dateFrom = $('#filter-date-from').val();
+    const dateTo = $('#filter-date-to').val();
+    loadResults(null, 'aggregate', selectedScanIds, dateFrom, dateTo);
     $('#view-mode-indicator').show();
     $('#view-mode-text').text(`Visualizando: ${selectedScanIds.length} scans selecionados (Agregado)`);
 }
 
 function viewAllScans() {
-    loadResults(null, 'aggregate', null);
+    const dateFrom = $('#filter-date-from').val();
+    const dateTo = $('#filter-date-to').val();
+    loadResults(null, 'aggregate', null, dateFrom, dateTo);
     $('#view-mode-indicator').show();
-    $('#view-mode-text').text('Visualizando: Todos os scans (Agregado)');
+
+    let text = 'Visualizando: Todos os scans (Agregado)';
+    if (dateFrom || dateTo) {
+        text += ' - com filtro de período';
+    }
+    $('#view-mode-text').text(text);
 }
 
 function closeAggregateView() {
@@ -128,9 +220,19 @@ function closeAggregateView() {
 
 // ==================== SCAN HISTORY ====================
 
-function loadScanHistory() {
+function loadScanHistory(dateFrom, dateTo) {
+    let url = '/api/scans';
+    const params = [];
+
+    if (dateFrom) params.push('date_from=' + dateFrom);
+    if (dateTo) params.push('date_to=' + dateTo);
+
+    if (params.length > 0) {
+        url += '?' + params.join('&');
+    }
+
     $.ajax({
-        url: '/api/scans',
+        url: url,
         type: 'GET',
         success: function(response) {
             if (response.success) {
@@ -166,7 +268,7 @@ function renderScanHistory(scans) {
 
         const row = `
             <tr>
-                <td><input type="checkbox" class="scan-checkbox" data-scan-id="${scan.id}"></td>
+                <td><input type="checkbox" class="scan-checkbox" data-scan-id="${scan.id}" value="${scan.id}"></td>
                 <td><code>${scan.filename}</code></td>
                 <td><small>${date}</small></td>
                 <td>${formatNumber(scan.packet_count)}</td>
@@ -193,7 +295,7 @@ function viewScan(scanId) {
 }
 
 function deleteScan(scanId) {
-    if (!confirm('Tem certeza que deseja excluir este scan?')) {
+    if (!confirm('Tem certeza que deseja excluir este scan?\n\nOs dados da análise e o arquivo PCAP serão removidos permanentemente.')) {
         return;
     }
 
@@ -208,6 +310,38 @@ function deleteScan(scanId) {
         },
         error: function(xhr) {
             alert('Erro ao excluir scan');
+        }
+    });
+}
+
+function deleteSelectedScans() {
+    const selectedIds = [];
+    $('.scan-checkbox:checked').each(function() {
+        selectedIds.push(parseInt($(this).val()));
+    });
+
+    if (selectedIds.length === 0) {
+        alert('Nenhum scan selecionado para exclusão.');
+        return;
+    }
+
+    if (!confirm(`Tem certeza que deseja excluir ${selectedIds.length} scan(s)?\n\nOs dados das análises e os arquivos PCAP serão removidos permanentemente. Esta ação não pode ser desfeita.`)) {
+        return;
+    }
+
+    $.ajax({
+        url: '/api/scans/batch',
+        type: 'DELETE',
+        contentType: 'application/json',
+        data: JSON.stringify({ ids: selectedIds }),
+        success: function(response) {
+            if (response.success) {
+                loadScanHistory();
+                alert(response.message);
+            }
+        },
+        error: function(xhr) {
+            alert('Erro ao excluir scans selecionados');
         }
     });
 }
@@ -259,7 +393,6 @@ function uploadFile() {
         contentType: false,
         success: function(response) {
             console.log('Upload successful:', response);
-            // Iniciar polling de status
             startStatusPolling();
         },
         error: function(xhr) {
@@ -274,12 +407,9 @@ function uploadFile() {
 }
 
 function startStatusPolling() {
-    // Limpar intervalo anterior se existir
     if (statusCheckInterval) {
         clearInterval(statusCheckInterval);
     }
-
-    // Polling a cada 500ms
     statusCheckInterval = setInterval(checkStatus, 500);
 }
 
@@ -288,17 +418,12 @@ function checkStatus() {
         url: '/api/status',
         type: 'GET',
         success: function(status) {
-            console.log('Status:', status);
-
-            // Atualizar UI
             updateStatus(status.status, status.message);
 
-            // Atualizar barra de progresso
             const progress = status.progress || 0;
             $('#progress-bar').css('width', progress + '%').text(progress + '%');
             $('#progress-message').text(status.message || 'Processing...');
 
-            // Se completou, carregar resultados
             if (status.status === 'completed') {
                 clearInterval(statusCheckInterval);
                 setTimeout(() => {
@@ -306,12 +431,10 @@ function checkStatus() {
                     loadScanHistory();
                     $('#upload-progress').hide();
                     $('#upload-btn').prop('disabled', false);
-                    // Limpar input
                     $('#pcap-file').val('');
                 }, 500);
             }
 
-            // Se erro
             if (status.status === 'error') {
                 clearInterval(statusCheckInterval);
                 alert('Erro na análise: ' + status.message);
@@ -366,7 +489,7 @@ function checkForResults() {
     });
 }
 
-function loadResults(scanId = null, view = 'single', scanIds = null) {
+function loadResults(scanId = null, view = 'single', scanIds = null, dateFrom = null, dateTo = null) {
     let url = '/api/results';
     const params = [];
 
@@ -375,6 +498,8 @@ function loadResults(scanId = null, view = 'single', scanIds = null) {
         if (scanIds && scanIds.length > 0) {
             params.push('scan_ids=' + scanIds.join(','));
         }
+        if (dateFrom) params.push('date_from=' + dateFrom);
+        if (dateTo) params.push('date_to=' + dateTo);
     } else if (scanId) {
         params.push('scan_id=' + scanId);
     }
@@ -404,9 +529,6 @@ function loadResults(scanId = null, view = 'single', scanIds = null) {
 }
 
 function renderResults(data) {
-    console.log('Rendering results:', data);
-
-    // Renderizar cada aba
     renderOverview(data);
     renderIPs(data);
     renderProtocols(data);
@@ -430,10 +552,8 @@ function renderOverview(data) {
     $('#metric-alerts').text(alerts.length);
     $('#alerts-badge').text(alerts.length);
 
-    // Gráfico de tráfego
+    // Gráficos
     renderTrafficChart(data.traffic_timeline || []);
-
-    // Gráfico de protocolos
     renderProtocolChart(protocols);
 
     // Alertas recentes
@@ -442,16 +562,17 @@ function renderOverview(data) {
 
 function renderTrafficChart(timeline) {
     const ctx = document.getElementById('traffic-chart');
-
     if (!ctx) return;
 
-    // Destruir gráfico anterior
     if (trafficChart) {
         trafficChart.destroy();
     }
 
+    const theme = document.documentElement.getAttribute('data-theme');
+    const textColor = theme === 'dark' ? '#e0e0e0' : '#666';
+    const gridColor = theme === 'dark' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)';
+
     if (!timeline || timeline.length === 0) {
-        // Mostrar mensagem de "sem dados"
         trafficChart = new Chart(ctx, {
             type: 'line',
             data: {
@@ -466,12 +587,15 @@ function renderTrafficChart(timeline) {
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
+                scales: {
+                    x: { ticks: { color: textColor }, grid: { color: gridColor } },
+                    y: { ticks: { color: textColor }, grid: { color: gridColor } }
+                }
             }
         });
         return;
     }
 
-    // Preparar dados
     const labels = timeline.map(t => {
         const date = new Date(t.timestamp * 1000);
         return date.toLocaleTimeString();
@@ -495,18 +619,19 @@ function renderTrafficChart(timeline) {
             responsive: true,
             maintainAspectRatio: false,
             plugins: {
-                legend: {
-                    display: false
-                }
+                legend: { display: false }
             },
             scales: {
+                x: { ticks: { color: textColor }, grid: { color: gridColor } },
                 y: {
                     beginAtZero: true,
                     ticks: {
+                        color: textColor,
                         callback: function(value) {
                             return formatBytes(value);
                         }
-                    }
+                    },
+                    grid: { color: gridColor }
                 }
             }
         }
@@ -515,20 +640,19 @@ function renderTrafficChart(timeline) {
 
 function renderProtocolChart(protocols) {
     const ctx = document.getElementById('protocol-chart');
-
     if (!ctx) return;
 
-    // Destruir gráfico anterior
     if (protocolChart) {
         protocolChart.destroy();
     }
 
-    // Top 5 protocolos
+    const theme = document.documentElement.getAttribute('data-theme');
+    const textColor = theme === 'dark' ? '#e0e0e0' : '#666';
+
     const top5 = protocols.slice(0, 5);
     const labels = top5.map(p => p.name);
     const data = top5.map(p => p.bytes);
 
-    // Cores
     const colors = [
         'rgba(255, 99, 132, 0.8)',
         'rgba(54, 162, 235, 0.8)',
@@ -551,7 +675,8 @@ function renderProtocolChart(protocols) {
             maintainAspectRatio: false,
             plugins: {
                 legend: {
-                    position: 'bottom'
+                    position: 'bottom',
+                    labels: { color: textColor }
                 }
             }
         }
@@ -592,12 +717,10 @@ function renderIPs(data) {
     const tbody = $('#ips-tbody');
     tbody.empty();
 
-    // Destruir DataTable anterior se existir
     if (ipsDataTable) {
         ipsDataTable.destroy();
     }
 
-    // Preencher tabela
     ips.forEach(ip => {
         const typeLabel = ip.is_local ?
             '<span class="badge bg-primary">Local</span>' :
@@ -619,12 +742,26 @@ function renderIPs(data) {
             `<span class="badge bg-info">${escapeHtml(ip.group)}</span>` :
             '<span class="text-muted">-</span>';
 
+        // Geolocalização
+        let geoCell = '<span class="text-muted">-</span>';
+        if (ip.geolocation) {
+            const geo = ip.geolocation;
+            const flag = getCountryFlag(geo.country_code);
+            geoCell = `<span title="${geo.city || ''}, ${geo.region || ''}, ${geo.country || ''} | ISP: ${geo.isp || ''}">${flag} ${geo.country || ''}</span>`;
+            if (geo.city) {
+                geoCell = `<span title="${geo.city}, ${geo.region || ''}, ${geo.country || ''} | ISP: ${geo.isp || ''}">${flag} ${geo.city}</span>`;
+            }
+        } else if (ip.is_local) {
+            geoCell = '<span class="text-muted">Local</span>';
+        }
+
         const row = `
             <tr>
                 <td><code>${ip.ip}</code></td>
                 <td>${nameCell}</td>
                 <td>${groupCell}</td>
                 <td>${typeLabel}</td>
+                <td>${geoCell}</td>
                 <td>${formatNumber(ip.packets_sent)}</td>
                 <td>${formatNumber(ip.packets_received)}</td>
                 <td>${formatBytes(ip.bytes_sent)}</td>
@@ -645,14 +782,22 @@ function renderIPs(data) {
         tbody.append(row);
     });
 
-    // Inicializar DataTable
     ipsDataTable = $('#ips-table').DataTable({
-        order: [[6, 'desc']],  // Ordenar por bytes enviados
+        order: [[7, 'desc']],  // Ordenar por bytes enviados
         pageLength: 25,
         language: {
             url: '//cdn.datatables.net/plug-ins/1.13.6/i18n/pt-BR.json'
         }
     });
+}
+
+function getCountryFlag(countryCode) {
+    if (!countryCode) return '';
+    const codePoints = countryCode
+        .toUpperCase()
+        .split('')
+        .map(char => 127397 + char.charCodeAt(0));
+    return String.fromCodePoint(...codePoints);
 }
 
 // ==================== RENDERIZAÇÃO: PROTOCOLOS ====================
@@ -662,12 +807,10 @@ function renderProtocols(data) {
     const tbody = $('#protocols-tbody');
     tbody.empty();
 
-    // Destruir DataTable anterior se existir
     if (protocolsDataTable) {
         protocolsDataTable.destroy();
     }
 
-    // Preencher tabela
     protocols.forEach(proto => {
         const riskBadge = getRiskBadge(proto.risk_level);
 
@@ -689,9 +832,8 @@ function renderProtocols(data) {
         tbody.append(row);
     });
 
-    // Inicializar DataTable
     protocolsDataTable = $('#protocols-table').DataTable({
-        order: [[2, 'desc']],  // Ordenar por bytes
+        order: [[2, 'desc']],
         pageLength: 25,
         language: {
             url: '//cdn.datatables.net/plug-ins/1.13.6/i18n/pt-BR.json'
@@ -702,16 +844,13 @@ function renderProtocols(data) {
 function showProtocolIPs(protocolName) {
     if (!currentData) return;
 
-    // Verificar se temos estatísticas detalhadas por protocolo
     const protocolIps = currentData.protocol_ips ? currentData.protocol_ips[protocolName] : null;
 
     let content = `<h6>IPs que utilizaram ${protocolName}:</h6>`;
 
     if (protocolIps && protocolIps.length > 0) {
-        // Usar estatísticas detalhadas do protocolo
         content += '<div class="table-responsive"><table class="table table-sm table-striped"><thead><tr><th>IP</th><th>Nome</th><th>Tipo</th><th>Pacotes</th><th>Bytes</th></tr></thead><tbody>';
 
-        // Obter nomes dos IPs
         const ipNames = {};
         if (currentData.ips) {
             currentData.ips.forEach(ip => {
@@ -723,7 +862,6 @@ function showProtocolIPs(protocolName) {
             const typeLabel = ipData.is_local ?
                 '<span class="badge bg-primary">Local</span>' :
                 '<span class="badge bg-secondary">Externo</span>';
-            // Use name from protocol_ips data or fallback to ipNames lookup
             const name = ipData.name || ipNames[ipData.ip] || '-';
 
             content += `<tr>
@@ -737,7 +875,6 @@ function showProtocolIPs(protocolName) {
 
         content += '</tbody></table></div>';
 
-        // Estatísticas gerais
         const totalPackets = protocolIps.reduce((sum, ip) => sum + ip.packets, 0);
         const totalBytes = protocolIps.reduce((sum, ip) => sum + ip.bytes, 0);
         const localCount = protocolIps.filter(ip => ip.is_local).length;
@@ -759,7 +896,6 @@ function showProtocolIPs(protocolName) {
         </div>`;
 
     } else {
-        // Fallback: usar lista de IPs geral
         const ipsWithProtocol = currentData.ips ? currentData.ips.filter(ip =>
             ip.protocols && ip.protocols.includes(protocolName)
         ) : [];
@@ -779,7 +915,6 @@ function showProtocolIPs(protocolName) {
         }
     }
 
-    // Mostrar em modal
     $('#evolution-ip').text(protocolName);
     $('#evolution-content').html(content);
     $('#ipEvolutionModal .modal-title').html(`<i class="fas fa-layer-group"></i> Protocolo: ${protocolName}`);
@@ -836,7 +971,6 @@ function renderAlertDetails(details) {
     for (const [key, value] of Object.entries(details)) {
         let displayValue = value;
 
-        // Formatação especial
         if (Array.isArray(value)) {
             displayValue = value.join(', ');
         }
@@ -885,7 +1019,6 @@ function saveIpName() {
         success: function(response) {
             if (response.success) {
                 bootstrap.Modal.getInstance('#editIpNameModal').hide();
-                // Recarregar resultados para atualizar nomes
                 loadResults();
                 alert('Nome salvo com sucesso!');
             }
@@ -1074,7 +1207,6 @@ function loadSettings() {
             if (response.success && response.data) {
                 const settings = response.data;
 
-                // Thresholds
                 const thresholds = settings.thresholds || {};
                 $('#threshold-port-scan-min').val(thresholds.port_scan_min_ports || 20);
                 $('#threshold-port-scan-time').val(thresholds.port_scan_time_window || 30);
@@ -1082,7 +1214,6 @@ function loadSettings() {
                 $('#threshold-dns-subdomain').val(thresholds.dns_subdomain_length || 50);
                 $('#threshold-dns-entropy').val(thresholds.dns_entropy_min || 3.5);
 
-                // Trusted ranges
                 renderTrustedRanges(settings.trusted_ranges || []);
             }
         },
@@ -1101,7 +1232,6 @@ function saveThresholds() {
         dns_entropy_min: parseFloat($('#threshold-dns-entropy').val())
     };
 
-    // Carregar configurações atuais
     $.ajax({
         url: '/api/settings',
         type: 'GET',
@@ -1109,7 +1239,6 @@ function saveThresholds() {
             const settings = response.data || {};
             settings.thresholds = thresholds;
 
-            // Salvar
             $.ajax({
                 url: '/api/settings',
                 type: 'POST',
@@ -1184,7 +1313,6 @@ function deleteTrustedRange(cidr) {
         return;
     }
 
-    // Codificar CIDR para URL
     const encodedCidr = cidr.replace('/', '-');
 
     $.ajax({

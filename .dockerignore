@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+data/analyzer.db
+data/results.json
+.git/
+.gitignore
+*.md
+!README.md
